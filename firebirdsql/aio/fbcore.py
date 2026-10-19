@@ -253,6 +253,11 @@ class AsyncCursor(Cursor):
                 calc_blr(stmt.xsqlda))
             self._callproc_result = await self.transaction.connection._async_op_sql_response(stmt.xsqlda)
             await self.transaction.connection._async_op_response()
+            if self._callproc_result and any(x.sqltype == SQL_TYPE_BLOB for x in stmt.xsqlda):
+                # Use the async SELECT decoder for singleton BLOB output too.
+                rows = stmt.fetch_generator([list(self._callproc_result)], False)
+                self._callproc_result = list(await rows.__anext__())
+                await rows.aclose()
             self._fetch_records = None
         else:
             DEBUG_OUTPUT(
