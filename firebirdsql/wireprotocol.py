@@ -314,10 +314,22 @@ class WireProtocol(object):
                     v += digits[i] * (10 ** (ln - i - 1))
                 if sign:
                     v *= -1
-                v = bint_to_bytes(v, 8)
-                if exponent < 0:
-                    exponent += 256
-                blr += bytes([16, exponent])
+                if -(2**63) <= v < 2**63 and -128 <= exponent <= 127:
+                    v = bint_to_bytes(v, 8)
+                    blr += bytes([16, exponent & 255])
+                else:
+                    # The scaled INT64 wire representation must not silently
+                    # truncate a larger coefficient or wrap its signed scale.
+                    # Decimal text is exact and lets the server convert to the
+                    # destination type, including INT128-backed NUMERICs.
+                    v = str(p).encode('ascii')
+                    if len(v) > MAX_CHAR_LENGTH:
+                        v = self._create_blob(trans_handle, v)
+                        blr += bytes([9, 0])
+                    else:
+                        nbytes = len(v)
+                        v += bytes([0]) * ((4 - nbytes) & 3)
+                        blr += bytes([14, nbytes & 255, nbytes >> 8])
             elif t == datetime.date:
                 v = convert_date(p)
                 blr += bytes([12])
