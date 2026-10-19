@@ -675,7 +675,7 @@ class ConnectionResponseMixin:
                 message = message.replace('@' + str(num_arg), str(num))
             elif n == isc_arg_string:
                 nbytes = bytes_to_bint(self._recv_channel(4))
-                s = self.bytes_to_str(self._recv_channel(nbytes, word_alignment=True))
+                s = self.bytes_to_str(self._recv_channel(nbytes, word_alignment=True), errors='replace')
                 num_arg += 1
                 message = message.replace('@' + str(num_arg), s)
             elif n == isc_arg_interpreted:
