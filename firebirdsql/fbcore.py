@@ -703,7 +703,7 @@ class ConnectionResponseMixin:
             raise IntegrityError(message, gds_codes, sql_code)
         elif gds_codes.intersection([335544321]):
             raise DataError(message, gds_codes, sql_code)
-        elif (sql_code or message) and not gds_codes.intersection([335544434]):
+        elif sql_code or message:
             raise OperationalError(message, gds_codes, sql_code)
         return (h, oid, buf)
 

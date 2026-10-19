@@ -4,6 +4,7 @@ import struct
 import unittest
 
 from firebirdsql.consts import isc_arg_end, isc_arg_gds, isc_arg_string
+from firebirdsql.err import OperationalError
 from firebirdsql.fbcore import ConnectionResponseMixin
 from firebirdsql.aio.fbcore import AsyncConnectionResponseMixin
 from firebirdsql.wireprotocol import WireProtocol
@@ -25,9 +26,9 @@ class Response(AsyncConnectionResponseMixin, WireProtocol):
         return self._recv_channel(size, word_alignment)
 
 
-def vector(value):
+def vector(value, code=335544569):
     pack = lambda n: struct.pack('!i', n)
-    return (pack(isc_arg_gds) + pack(335544569) + pack(isc_arg_string)
+    return (pack(isc_arg_gds) + pack(code) + pack(isc_arg_string)
             + pack(len(value)) + value + b'\0' * (-len(value) % 4)
             + pack(isc_arg_end))
 
@@ -44,6 +45,19 @@ class StatusVectorTest(unittest.TestCase):
                         result = ConnectionResponseMixin._parse_status_vector(response)
                     self.assertIn(335544569, result[0])
                     self.assertEqual(response.buffer, b'NEXT')
+
+    def test_index_key_size_error_is_not_suppressed(self):
+        for asynchronous in (False, True):
+            with self.subTest(asynchronous=asynchronous):
+                response = Response(bytes(16) + vector(b'long_index', 335544434) + b'NEXT')
+                with self.assertRaises(OperationalError) as caught:
+                    if asynchronous:
+                        asyncio.run(response._async_parse_op_response())
+                    else:
+                        response._parse_op_response()
+                self.assertIn('key size exceeds', str(caught.exception))
+                self.assertIn('long_index', str(caught.exception))
+                self.assertEqual(response.buffer, b'NEXT')
 
     def test_data_decoding_remains_strict(self):
         with self.assertRaises(UnicodeDecodeError):
