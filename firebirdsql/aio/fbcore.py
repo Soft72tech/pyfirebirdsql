@@ -764,8 +764,8 @@ class AsyncConnectionResponseMixin(ConnectionResponseMixin):
                 if enc_plugin in (b'ChaCha64', b'ChaCha'):
                     k = hashlib.sha256(session_key).digest()
                     self.sock.set_translator(
-                        ChaCha20.new(k, nonce),
-                        ChaCha20.new(k, nonce),
+                        ChaCha20.new(key=k, nonce=nonce),
+                        ChaCha20.new(key=k, nonce=nonce),
                     )
                 elif enc_plugin == b'Arc4':
                     self.sock.set_translator(
