@@ -265,6 +265,7 @@ class Cursor(object):
     def _execute(self, query: str | PreparedStatement, params: Sequence[Any] | None) -> 'Cursor':
         if params is None:
             params = []
+        self.transaction.connection._cursors.setdefault(self.transaction, weakref.WeakSet()).add(self)
         self.transaction.check_trans_handle()
         stmt = self._get_stmt(query)
         cooked_params = self._convert_params(params)
@@ -518,15 +519,7 @@ class Transaction(object):
         self.is_dirty = False
 
     def close(self) -> None:
-        if self._trans_handle is None:
-            return
-        if not self.is_dirty:
-            return
-        DEBUG_OUTPUT("Transaction::close()", self._trans_handle, self.connection.db_handle)
-        self.connection._op_rollback(self._trans_handle)
-        (h, oid, buf) = self.connection._op_response()
-        self._trans_handle = None
-        self.is_dirty = False
+        self.rollback()
 
     def begin(self) -> None:
         DEBUG_OUTPUT("Transaction::begin()")
@@ -544,8 +537,9 @@ class Transaction(object):
             "Transaction::commit()", self._trans_handle, self.connection.db_handle, retaining)
         if self._trans_handle is None:
             return
-        if not self.is_dirty:
-            return
+        if not retaining:
+            for cursor in list(self.connection._cursors.get(self, ())):
+                cursor.close()
         if retaining:
             self.connection._op_commit_retaining(self._trans_handle)
             (h, oid, buf) = self.connection._op_response()
@@ -566,8 +560,9 @@ class Transaction(object):
                 self._trans_handle, query='ROLLBACK TO '+savepoint)
             (h, oid, buf) = self.connection._op_response()
             return
-        if not self.is_dirty:
-            return
+        if not retaining:
+            for cursor in list(self.connection._cursors.get(self, ())):
+                cursor.close()
         if retaining:
             self.connection._op_rollback_retaining(self._trans_handle)
             (h, oid, buf) = self.connection._op_response()
@@ -1023,7 +1018,7 @@ class ConnectionBase(WireProtocol):
             raise InternalError("Missing socket")
         if self._transaction is None:
             self._transaction = Transaction(self, self._autocommit)
-        self._cursors[self._transaction] = weakref.WeakSet()
+        self._cursors.setdefault(self._transaction, weakref.WeakSet())
         self._transaction.begin()
 
     def commit(self, retaining: bool = False) -> None:

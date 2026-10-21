@@ -23,7 +23,7 @@ class SingletonBlobTest(unittest.TestCase):
                      (102, b'', b''), (2, b'', b'\x02\x00\xc3\xa9'),
                      (0, b'', b'')]
         statement = SimpleNamespace(
-            handle=3, trans=transaction,
+            handle=3, trans=transaction, bind_xsqlda=[],
             stmt_type=isc_info_sql_stmt_exec_procedure,
             xsqlda=[SimpleNamespace(sqltype=SQL_TYPE_BLOB, sqlsubtype=subtype)
                     for subtype in (0, 1, 0)] +
@@ -42,13 +42,14 @@ class SingletonBlobTest(unittest.TestCase):
             connection._op_response = Mock(side_effect=responses)
             statement.fetch_generator = MethodType(Statement.fetch_generator, statement)
         cursor._transaction = transaction
+        cursor.arraysize = 1
         return cursor, connection, row
 
     def test_sync_singleton_materializes_binary_text_and_null(self):
         cursor, connection, original = self.fixture(False)
         with patch('firebirdsql.fbcore.calc_blr', return_value=b'blr'):
-            cursor.execute('INSERT ... RETURNING ...')
-        self.assertEqual(cursor.fetchone(), [b'abc', 'é', None, 42])
+            cursor._execute('INSERT ... RETURNING ...', None)
+        self.assertEqual(cursor.fetchone(), (b'abc', 'é', None, 42))
         self.assertIsNone(cursor.fetchone())
         self.assertEqual(original, [b'binaryid', b'textblob', None, 42])
         self.assertEqual(connection._op_open_blob2.call_count, 2)
@@ -58,7 +59,7 @@ class SingletonBlobTest(unittest.TestCase):
         async def run():
             cursor, connection, original = self.fixture(True)
             with patch('firebirdsql.aio.fbcore.calc_blr', return_value=b'blr'):
-                await cursor.execute('INSERT ... RETURNING ...')
+                await cursor._execute('INSERT ... RETURNING ...', None)
             self.assertEqual(await cursor.fetchone(), [b'abc', 'é', None, 42])
             self.assertIsNone(await cursor.fetchone())
             self.assertEqual(original, [b'binaryid', b'textblob', None, 42])

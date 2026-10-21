@@ -167,7 +167,7 @@ class AsyncStatement(Statement):
 
     async def drop(self):
         DEBUG_OUTPUT("AsyncStatement::drop()", self.handle)
-        if self.handle != -1 and self._is_open:
+        if self.handle != -1:
             self.trans.connection._op_free_statement(self.handle, DSQL_drop)
             if (self.trans.connection.accept_type & ptype_MASK) == ptype_lazy_send:
                 self.trans.connection.lazy_response_count += 1
@@ -243,6 +243,7 @@ class AsyncCursor(Cursor):
     async def _execute(self, query: str | PreparedStatement, params: Sequence[Any] | None) -> 'AsyncCursor':
         if params is None:
             params = []
+        self.transaction.connection._cursors.setdefault(self.transaction, weakref.WeakSet()).add(self)
         await self.transaction.check_trans_handle()
         stmt = await self._get_stmt(query)
         cooked_params = self._convert_params(params)
@@ -255,7 +256,7 @@ class AsyncCursor(Cursor):
             await self.transaction.connection._async_op_response()
             if self._callproc_result and any(x.sqltype == SQL_TYPE_BLOB for x in stmt.xsqlda):
                 # Use the async SELECT decoder for singleton BLOB output too.
-                rows = stmt.fetch_generator([list(self._callproc_result)], False)
+                rows = stmt.fetch_generator([list(self._callproc_result)], False, self.arraysize)
                 self._callproc_result = list(await rows.__anext__())
                 await rows.aclose()
             self._fetch_records = None
@@ -408,12 +409,17 @@ class AsyncCursor(Cursor):
 
     @property
     def description(self) -> list[tuple[str, int, int, int, int, int, bool]] | None:
-        if not self.stmt:
+        if not self.stmt or not self.stmt.xsqlda:
             return None
         return [(
             x.aliasname, x.sqltype, x.display_length(), x.io_length(),
             x.precision(), x.sqlscale, True if x.null_ok else False
         ) for x in self.stmt.xsqlda]
+
+    async def get_rowcount(self) -> int:
+        """Refresh counters asynchronously for integrations fetching buffered rows."""
+        self.rowcount = await self._rowcount()
+        return self.rowcount
 
     async def _rowcount(self) -> int:
         DEBUG_OUTPUT("AsyncCursor::rowcount()")
@@ -469,8 +475,9 @@ class AsyncTransaction(Transaction):
             "AsyncTransaction::commit()", self._trans_handle, self.connection.db_handle, retaining)
         if self._trans_handle is None:
             return
-        if not self.is_dirty:
-            return
+        if not retaining:
+            for cursor in list(self.connection._cursors.get(self, ())):
+                await cursor.close()
         if retaining:
             self.connection._op_commit_retaining(self._trans_handle)
             (h, oid, buf) = await self.connection._async_op_response()
@@ -491,8 +498,9 @@ class AsyncTransaction(Transaction):
                 self._trans_handle, query='ROLLBACK TO '+savepoint)
             (h, oid, buf) = await self.connection._async_op_response()
             return
-        if not self.is_dirty:
-            return
+        if not retaining:
+            for cursor in list(self.connection._cursors.get(self, ())):
+                await cursor.close()
         if retaining:
             self.connection._op_rollback_retaining(self._trans_handle)
             (h, oid, buf) = await self.connection._async_op_response()
@@ -546,106 +554,7 @@ class AsyncTransaction(Transaction):
             await self._begin()
 
     async def close(self) -> None:
-        if self._trans_handle is None:
-            return
-        if not self.is_dirty:
-            return
-        DEBUG_OUTPUT("AsyncTransaction::close()", self._trans_handle, self.connection.db_handle)
-        self.connection._op_rollback(self._trans_handle)
-        (h, oid, buf) = await self.connection._async_op_response()
-        self._trans_handle = None
-        self.is_dirty = False
-
-        DEBUG_OUTPUT(
-            "AsyncTransaction::commit()", self._trans_handle, self.connection.db_handle, retaining)
-        if self._trans_handle is None:
-            return
-        if not self.is_dirty:
-            return
-        if retaining:
-            self.connection._op_commit_retaining(self._trans_handle)
-            (h, oid, buf) = await self.connection._async_op_response()
-        else:
-            self.connection._op_commit(self._trans_handle)
-            (h, oid, buf) = await self.connection._async_op_response()
-            self._trans_handle = None
-        self.is_dirty = False
-
-    async def rollback(self, retaining=False, savepoint=None):
-        DEBUG_OUTPUT(
-            "AsyncTransaction::rollback()", self._trans_handle,
-            self.connection.db_handle, retaining, savepoint)
-        if self._trans_handle is None:
-            return
-        if savepoint:
-            self.connection._op_exec_immediate(
-                self._trans_handle, query='ROLLBACK TO '+savepoint)
-            (h, oid, buf) = await self.connection._async_op_response()
-            return
-        if not self.is_dirty:
-            return
-        if retaining:
-            self.connection._op_rollback_retaining(self._trans_handle)
-            (h, oid, buf) = await self.connection._async_op_response()
-        else:
-            self.connection._op_rollback(self._trans_handle)
-            (h, oid, buf) = await self.connection._async_op_response()
-            self._trans_handle = None
-        self.is_dirty = False
-
-    async def _trans_info(self, info_requests):
-        if info_requests[-1] == isc_info_end:
-            self.connection._op_info_transaction(self.trans_handle, bytes(info_requests))
-        else:
-            self.connection._op_info_transaction(
-                self.trans_handle, bytes(info_requests+type(info_requests)([isc_info_end])))
-        (h, oid, buf) = await self.connection._async_op_response()
-        i = 0
-        i_request = 0
-        r = []
-        while i < len(buf):
-            req = buf[i]
-            if req == isc_info_end:
-                break
-            assert req == info_requests[i_request] or req == isc_info_error
-            ln = bytes_to_int(buf[i+1:i+3])
-            r.append((req, buf[i+3:i+3+ln]))
-            i = i + 3 + ln
-
-            i_request += 1
-        return r
-
-    async def trans_info(self, info_requests):
-        if type(info_requests) == int:  # singleton
-            r = self._trans_info([info_requests])
-            return {info_requests: r[1][0]}
-        else:
-            results = {}
-            rs = await self._trans_info(info_requests)
-            for i in range(len(info_requests)):
-                if rs[i][0] == isc_info_tra_isolation:
-                    v = (rs[i][1][0], rs[i][1][1])
-                elif rs[i][0] == isc_info_error:
-                    v = None
-                else:
-                    v = bytes_to_int(rs[i][1])
-                results[info_requests[i]] = v
-            return results
-
-    async def check_trans_handle(self):
-        if self._trans_handle is None:
-            await self._begin()
-
-    async def close(self):
-        if self._trans_handle is None:
-            return
-        if not self.is_dirty:
-            return
-        DEBUG_OUTPUT("AsyncTransaction::close()", self._trans_handle, self.connection.db_handle)
-        self.connection._op_rollback(self._trans_handle)
-        (h, oid, buf) = await self.connection._async_op_response()
-        self._trans_handle = None
-        self.is_dirty = False
+        await self.rollback()
 
 
 class AsyncConnectionResponseMixin(ConnectionResponseMixin):
@@ -655,11 +564,19 @@ class AsyncConnectionResponseMixin(ConnectionResponseMixin):
             n += 4 - nbytes % 4  # 4 bytes word alignment
         r = bytes([])
         while n:
-            if self.timeout is not None:
-                b = await asyncio.wait_for(self.sock.async_recv(n), timeout=self.timeout)
-            else:
-                b = await self.sock.async_recv(n)
+            try:
+                if self.timeout is not None:
+                    b = await asyncio.wait_for(self.sock.async_recv(n), timeout=self.timeout)
+                else:
+                    b = await self.sock.async_recv(n)
+            except asyncio.CancelledError:
+                self.terminate()
+                raise
+            except (OSError, asyncio.TimeoutError) as exc:
+                self.terminate()
+                raise OperationalError('Can not recv() packets') from exc
             if not b:
+                self.terminate()
                 break
             r += b
             n -= len(b)
@@ -1019,11 +936,14 @@ class AsyncConnection(ConnectionBase, AsyncConnectionResponseMixin):
             self._op_ping()
             (h, oid, buf) = await self._async_op_response()
             return h == 0
-        except:
-            if reconnect:
-                await self.reconnect()
-                return await self.ping(False)
-            return False
+        except asyncio.CancelledError:
+            self.terminate()
+            raise
+        except Exception:
+            if not reconnect:
+                raise
+            await self.reconnect()
+            return await self.ping(False)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.sock = None
@@ -1041,16 +961,15 @@ class AsyncConnection(ConnectionBase, AsyncConnectionResponseMixin):
 
         self.sock = AsyncSocketStream(self.hostname, self.port, self.loop, self.timeout, self.cloexec)
 
-        self._op_connect(self.auth_plugin_name, self.wire_crypt, self.wire_compress)
         try:
+            self._op_connect(self.auth_plugin_name, self.wire_crypt, self.wire_compress)
             await self._async_parse_connect_response()
-        except OperationalError as e:
-            self.sock.close()
-            self.sock = None
-            raise e
-        self._op_attach(self.timezone)
-        (h, oid, buf) = await self._async_op_response()
-        self.db_handle = h
+            self._op_attach(self.timezone)
+            (h, oid, buf) = await self._async_op_response()
+            self.db_handle = h
+        except BaseException:
+            self.terminate()
+            raise
         DEBUG_OUTPUT("AsyncConnection::_initialize()", id(self), self.db_handle)
 
     async def __aenter__(self) -> 'AsyncConnection':
@@ -1058,14 +977,16 @@ class AsyncConnection(ConnectionBase, AsyncConnectionResponseMixin):
 
     async def __aexit__(self, exc: Any, value: Any, traceback: Any) -> None:
         "On successful exit, commit. On exception, rollback. "
-        if exc:
-            await self.rollback()
-        else:
-            await self.commit()
-        await self.close()
+        try:
+            if exc:
+                await self.rollback()
+            else:
+                await self.commit()
+        finally:
+            await self.close()
 
     async def reconnect(self) -> None:
-        self._close()
+        self.terminate()
         await self._initialize()
 
     async def set_autocommit(self, is_autocommit: bool) -> None:
@@ -1127,26 +1048,38 @@ class AsyncConnection(ConnectionBase, AsyncConnectionResponseMixin):
             self.sock = None
         self.db_handle = None
 
+    def terminate(self) -> None:
+        """Discard the transport without protocol I/O after errors or cancellation."""
+        sock, self.sock = self.sock, None
+        self.db_handle = None
+        self._transaction = None
+        self._cursors = {}
+        if sock is not None:
+            sock.close()
+
     async def close(self) -> None:
         DEBUG_OUTPUT("AsyncConnection::close()", id(self), self.db_handle)
         if self.sock is None:
             return
-        if self.db_handle is not None:
-            # cleanup transaction
-            for trans in list(self._cursors.keys()):
-                await trans.close()
-            if self.is_services:
-                self._op_service_detach()
-            else:
-                self._op_detach()
-            (h, oid, buf) = await self._async_op_response()
-        self.sock.close()
-        self.sock = None
-        self.db_handle = None
+        try:
+            if self.db_handle is not None:
+                transactions = set(self._cursors)
+                if self._transaction is not None:
+                    transactions.add(self._transaction)
+                for trans in transactions:
+                    await trans.rollback()
+                if self.is_services:
+                    self._op_service_detach()
+                else:
+                    self._op_detach()
+                await self._async_op_response()
+        finally:
+            self.terminate()
+
+    async def aclose(self) -> None:
+        """Compatibility alias for integrations using explicit async cleanup."""
+        await self.close()
 
     def __del__(self) -> None:
-        if self.sock:
-            # Async close cannot be called from __del__
-            # self.close()
-            pass
-
+        if getattr(self, 'sock', None):
+            self.terminate()
